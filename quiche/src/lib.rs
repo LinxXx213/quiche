@@ -400,10 +400,14 @@ use qlog::events::EventImportance;
 use qlog::events::EventType;
 #[cfg(feature = "qlog")]
 use qlog::events::RawInfo;
+use stream::StreamPriorityKey;
 
 use std::cmp;
 use std::convert::TryInto;
+use std::sync::atomic;
 use std::time;
+
+use std::sync::Arc;
 
 use std::net::SocketAddr;
 
@@ -4541,6 +4545,9 @@ impl Connection {
         let was_writable = stream.is_writable();
 
         let was_flushable = stream.is_flushable();
+        let was_linked = stream.priority_key.writable.is_linked();
+
+        let priority_key = Arc::clone(&stream.priority_key);
 
         // Truncate the input buffer based on the connection's send capacity if
         // necessary.
@@ -4548,14 +4555,14 @@ impl Connection {
         // When the cap is zero, the method returns Ok(0) *only* when the passed
         // buffer is empty. We return Error::Done otherwise.
         if cap == 0 && !buf.is_empty() {
-            if was_writable {
+            if was_writable && !was_linked {
                 // When `stream_writable_next()` returns a stream, the writable
                 // mark is removed, but because the stream is blocked by the
                 // connection-level send capacity it won't be marked as writable
                 // again once the capacity increases.
                 //
                 // Since the stream is writable already, mark it here instead.
-                self.streams.mark_writable(stream_id, true);
+                self.streams.mark_writable(stream_id, &priority_key, true);
             }
 
             return Err(Error::Done);
@@ -4571,7 +4578,9 @@ impl Connection {
             Ok(v) => v,
 
             Err(e) => {
-                self.streams.mark_writable(stream_id, false);
+                if was_linked {
+                    self.streams.mark_writable(stream_id, &priority_key, false);
+                }
                 return Err(e);
             },
         };
@@ -4582,6 +4591,8 @@ impl Connection {
         let flushable = stream.is_flushable();
 
         let writable = stream.is_writable();
+
+        let was_linked = stream.priority_key.writable.is_linked();
 
         let empty_fin = buf.is_empty() && fin;
 
@@ -4606,16 +4617,16 @@ impl Connection {
             self.streams.push_flushable(stream_id, urgency, incremental);
         }
 
-        if !writable {
-            self.streams.mark_writable(stream_id, false);
-        } else if was_writable && blocked_by_cap {
+        if !writable && was_linked {
+            self.streams.mark_writable(stream_id, &priority_key, false);
+        } else if was_writable && blocked_by_cap && !was_linked {
             // When `stream_writable_next()` returns a stream, the writable
             // mark is removed, but because the stream is blocked by the
             // connection-level send capacity it won't be marked as writable
             // again once the capacity increases.
             //
             // Since the stream is writable already, mark it here instead.
-            self.streams.mark_writable(stream_id, true);
+            self.streams.mark_writable(stream_id, &priority_key, true);
         }
 
         self.tx_cap -= sent;
@@ -4670,10 +4681,29 @@ impl Connection {
             return Ok(());
         }
 
+        let is_writable = stream.is_writable();
+
         stream.urgency = urgency;
         stream.incremental = incremental;
 
-        // TODO: reprioritization
+        let old_priority_key = stream.priority_key.clone();
+        let new_priority_key = Arc::new(StreamPriorityKey {
+            urgency: stream.urgency,
+            incremental: stream.incremental,
+            magic: atomic::AtomicBool::new(
+                old_priority_key.magic.load(atomic::Ordering::SeqCst),
+            ),
+            id: stream_id,
+            writable: Default::default(),
+        });
+
+        stream.priority_key = new_priority_key.clone();
+
+        self.streams.writable_prioritized_update(
+            &old_priority_key,
+            &new_priority_key,
+            is_writable,
+        );
 
         Ok(())
     }
@@ -4724,6 +4754,9 @@ impl Connection {
 
         // Get existing stream.
         let stream = self.streams.get_mut(stream_id).ok_or(Error::Done)?;
+        let was_linked = stream.priority_key.writable.is_linked();
+
+        let priority_key = Arc::clone(&stream.priority_key);
 
         match direction {
             Shutdown::Read => {
@@ -4753,7 +4786,9 @@ impl Connection {
                 self.streams.mark_reset(stream_id, true, err, final_size);
 
                 // Once shutdown, the stream is guaranteed to be non-writable.
-                self.streams.mark_writable(stream_id, false);
+                if was_linked {
+                    self.streams.mark_writable(stream_id, &priority_key, false);
+                }
             },
         }
 
@@ -4837,6 +4872,8 @@ impl Connection {
 
         for &stream_id in &self.streams.writable {
             if let Some(stream) = self.streams.get(stream_id) {
+                let was_linked = stream.priority_key.writable.is_linked();
+
                 let cap = match stream.send.cap() {
                     Ok(v) => v,
 
@@ -4844,13 +4881,25 @@ impl Connection {
                     // stopped.
                     Err(_) =>
                         return {
-                            self.streams.mark_writable(stream_id, false);
+                            if was_linked {
+                                self.streams.mark_writable(
+                                    stream_id,
+                                    &Arc::clone(&stream.priority_key),
+                                    false,
+                                );
+                            }
                             Some(stream_id)
                         },
                 };
 
                 if cmp::min(self.tx_cap, cap) >= stream.send_lowat {
-                    self.streams.mark_writable(stream_id, false);
+                    if was_linked {
+                        self.streams.mark_writable(
+                            stream_id,
+                            &Arc::clone(&stream.priority_key),
+                            false,
+                        );
+                    }
                     return Some(stream_id);
                 }
             }
@@ -4899,6 +4948,10 @@ impl Connection {
 
         let is_writable = stream.is_writable();
 
+        let was_linked = stream.priority_key.writable.is_linked();
+
+        let priority_key = Arc::clone(&stream.priority_key);
+
         if self.max_tx_data - self.tx_data < len as u64 {
             self.blocked_limit = Some(self.max_tx_data);
         }
@@ -4909,14 +4962,14 @@ impl Connection {
                 stream.send.update_blocked_at(Some(max_off));
                 self.streams.mark_blocked(stream_id, true, max_off);
             }
-        } else if is_writable {
+        } else if is_writable && !was_linked {
             // When `stream_writable_next()` returns a stream, the writable
             // mark is removed, but because the stream is blocked by the
             // connection-level send capacity it won't be marked as writable
             // again once the capacity increases.
             //
             // Since the stream is writable already, mark it here instead.
-            self.streams.mark_writable(stream_id, true);
+            self.streams.mark_writable(stream_id, &priority_key, true);
         }
 
         Ok(false)
@@ -5032,6 +5085,54 @@ impl Connection {
         }
 
         self.streams.writable()
+    }
+
+    /// Returns an iterator over streams that can be written in priority order.
+    ///
+    /// The priority order is based on RFC 9218 scheduling recommendations.
+    /// Stream priority can be controlled using [`stream_priority()`]. In order
+    /// to support fairness requirements, each time this method is called,
+    /// internal state is updated. Therefore the iterator ordering can change
+    /// between calls, even if no streams were added or removed.
+    ///
+    /// A "writable" stream is a stream that has enough flow control capacity to
+    /// send data to the peer. To avoid buffering an infinite amount of data,
+    /// streams are only allowed to buffer outgoing data up to the amount that
+    /// the peer allows to send.
+    ///
+    /// Note that the iterator will only include streams that were writable at
+    /// the time the iterator itself was created (i.e. when `writable()` was
+    /// called). To account for newly writable streams, the iterator needs to be
+    /// created again.
+    ///
+    /// ## Examples:
+    ///
+    /// ```no_run
+    /// # let mut buf = [0; 512];
+    /// # let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    /// # let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
+    /// # let local = socket.local_addr().unwrap();
+    /// # let peer = "127.0.0.1:1234".parse().unwrap();
+    /// # let mut conn = quiche::accept(&scid, None, local, peer, &mut config)?;
+    /// // Iterate over writable streams.
+    /// for stream_id in conn.writable_prioritized() {
+    ///     // Stream is writable, write some data.
+    ///     if let Ok(written) = conn.stream_send(stream_id, &buf, false) {
+    ///         println!("Written {} bytes on stream {}", written, stream_id);
+    ///     }
+    /// }
+    /// # Ok::<(), quiche::Error>(())
+    /// ```
+    ///
+    /// [`stream_priority()`]: struct.Connection.html#method.stream_priority
+    #[inline]
+    pub fn writable_prioritized(&mut self) -> StreamIter {
+        if self.tx_cap == 0 {
+            return StreamIter::default();
+        }
+
+        self.streams.writable_prioritized()
     }
 
     /// Returns the maximum possible size of egress UDP payloads.
@@ -6655,6 +6756,10 @@ impl Connection {
 
                 let was_writable = stream.is_writable();
 
+                let was_linked = stream.priority_key.writable.is_linked();
+
+                let priority_key = Arc::clone(&stream.priority_key);
+
                 // Try stopping the stream.
                 if let Ok((final_size, unsent)) = stream.send.stop(error_code) {
                     // Claw back some flow control allowance from data that was
@@ -6671,8 +6776,12 @@ impl Connection {
                     self.streams
                         .mark_reset(stream_id, true, error_code, final_size);
 
-                    if !was_writable {
-                        self.streams.mark_writable(stream_id, true);
+                    if !was_writable && !was_linked {
+                        self.streams.mark_writable(
+                            stream_id,
+                            &priority_key,
+                            true,
+                        );
                     }
                 }
             },
@@ -6801,6 +6910,10 @@ impl Connection {
 
                 let writable = stream.is_writable();
 
+                let was_linked = stream.priority_key.writable.is_linked();
+
+                let priority_key = Arc::clone(&stream.priority_key);
+
                 // If the stream is now flushable push it to the flushable queue,
                 // but only if it wasn't already queued.
                 if stream.is_flushable() && !was_flushable {
@@ -6809,8 +6922,8 @@ impl Connection {
                     self.streams.push_flushable(stream_id, urgency, incremental);
                 }
 
-                if writable {
-                    self.streams.mark_writable(stream_id, true);
+                if writable && !was_linked {
+                    self.streams.mark_writable(stream_id, &priority_key, true);
                 }
             },
 
