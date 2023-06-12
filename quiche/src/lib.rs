@@ -404,7 +404,6 @@ use stream::StreamPriorityKey;
 
 use std::cmp;
 use std::convert::TryInto;
-use std::sync::atomic;
 use std::time;
 
 use std::sync::Arc;
@@ -4690,9 +4689,6 @@ impl Connection {
         let new_priority_key = Arc::new(StreamPriorityKey {
             urgency: stream.urgency,
             incremental: stream.incremental,
-            magic: atomic::AtomicBool::new(
-                old_priority_key.magic.load(atomic::Ordering::SeqCst),
-            ),
             id: stream_id,
             writable: Default::default(),
         });

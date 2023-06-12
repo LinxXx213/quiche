@@ -26,7 +26,6 @@
 
 use std::cmp;
 
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use std::collections::hash_map;
@@ -36,8 +35,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
-use std::sync::atomic;
-use std::sync::atomic::AtomicBool;
 use std::time;
 
 use intrusive_collections::intrusive_adapter;
@@ -611,22 +608,14 @@ impl StreamMap {
         StreamIter::from(&self.writable)
     }
 
-    // Walk the priority tree
-    //
-    // Returns a flattened list of stream IDs in priority order, and a list of
-    // nodes keys that need to be updated in order to rebalance the tree for the
-    // next walk.
-    fn walk_priority_tree(
-        &mut self,
-    ) -> (SmallVec<[u64; 8]>, SmallVec<[Arc<StreamPriorityKey>; 8]>) {
+    pub fn writable_prioritized(&mut self) -> StreamIter {
         let mut ret: SmallVec<[u64; 8]> = SmallVec::new();
+
         let mut rebalance: SmallVec<[Arc<StreamPriorityKey>; 8]> =
             SmallVec::new();
 
         let mut curr_urgency = -1i8;
         let mut incr_visited = false;
-        let mut flipall = false;
-        let mut flipall_flipped = false;
 
         let mut cursor = self.writable_prioritized.front();
 
@@ -639,47 +628,15 @@ impl StreamMap {
             // group.
             if urgency > curr_urgency {
                 incr_visited = false;
-                flipall = false;
-                flipall_flipped = false;
                 curr_urgency = urgency;
             }
 
             if incremental {
-                // The first visit to incremental "magic=false" streams means
-                // that all streams in the group need flipping and that'll
-                // happen at the end.
+                // The first visit to an incremental stream in an urgency level
+                // means we need to rebalance it.
                 if !incr_visited {
                     incr_visited = true;
-
-                    if !s.magic.load(atomic::Ordering::SeqCst) {
-                        // If there is *only one* entry at this urgency level,
-                        // we can flip in place.
-                        if let Some(y) = cursor.peek_next().get() {
-                            if y.urgency as i8 != curr_urgency {
-                                s.magic.store(false, atomic::Ordering::SeqCst);
-                            } else {
-                                rebalance.push(cursor.clone_pointer().unwrap());
-                            }
-                        } else {
-                            // Last node at unique priority can be flipped in
-                            // place
-                            s.magic.store(false, atomic::Ordering::SeqCst);
-                        }
-                    } else {
-                        flipall = true;
-                    }
-                }
-
-                // Because the ordering is deterministic, we can flip all but the
-                // first in place. The first one is visited during this walk, so
-                // needs to be rebalanced.
-                if flipall {
-                    if !flipall_flipped {
-                        rebalance.push(cursor.clone_pointer().unwrap());
-
-                        flipall_flipped = true;
-                    }
-                    s.magic.store(false, atomic::Ordering::SeqCst);
+                    rebalance.push(cursor.clone_pointer().unwrap());
                 }
             }
 
@@ -688,33 +645,10 @@ impl StreamMap {
             cursor.move_next();
         }
 
-        (ret, rebalance)
-    }
+        for old in &rebalance {
+            self.writable_prioritized_remove(old);
 
-    pub fn writable_prioritized(&mut self) -> StreamIter {
-        let (ret, rebalance) = self.walk_priority_tree();
-
-        for s in &rebalance {
-            let mut c = {
-                let ptr = Arc::as_ptr(s);
-                unsafe { self.writable_prioritized.cursor_mut_from_ptr(ptr) }
-            };
-
-            c.remove();
-        }
-
-        for s in &rebalance {
-            let new_priority_key = Arc::new(StreamPriorityKey {
-                urgency: s.urgency,
-                incremental: s.incremental,
-                magic: atomic::AtomicBool::new(
-                    !s.magic.load(atomic::Ordering::SeqCst),
-                ),
-                id: s.id,
-                writable: Default::default(),
-            });
-
-            self.writable_prioritized.insert(new_priority_key);
+            self.writable_prioritized.insert(Arc::clone(old));
         }
 
         StreamIter {
@@ -843,7 +777,6 @@ impl Stream {
             priority_key: Arc::new(StreamPriorityKey {
                 urgency: DEFAULT_URGENCY,
                 incremental: true,
-                magic: AtomicBool::new(false),
                 id,
                 writable: Default::default(),
             }),
@@ -915,7 +848,6 @@ pub fn is_bidi(stream_id: u64) -> bool {
 pub struct StreamPriorityKey {
     pub urgency: u8,
     pub incremental: bool,
-    pub magic: AtomicBool,
     pub id: u64,
 
     pub writable: RBTreeAtomicLink,
@@ -927,73 +859,57 @@ impl Clone for StreamPriorityKey {
         StreamPriorityKey {
             urgency: self.urgency,
             incremental: self.incremental,
-            magic: atomic::AtomicBool::new(
-                self.magic.load(atomic::Ordering::SeqCst),
-            ),
             id: self.id,
             writable: self.writable.clone(),
         }
     }
 }
 
+impl PartialEq for StreamPriorityKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
 impl Eq for StreamPriorityKey {}
 
-impl Ord for StreamPriorityKey {
-    #[inline]
-    fn cmp(&self, other: &StreamPriorityKey) -> Ordering {
-        match Ord::cmp(&self.urgency, &other.urgency) {
-            Ordering::Equal => {
-                match Ord::cmp(&self.incremental, &other.incremental) {
-                    Ordering::Equal => match Ord::cmp(
-                        &self.magic.load(atomic::Ordering::SeqCst),
-                        &other.magic.load(atomic::Ordering::SeqCst),
-                    ) {
-                        Ordering::Equal => Ord::cmp(&self.id, &other.id),
-                        cmp => cmp,
-                    },
-                    cmp => cmp,
-                }
-            },
-            cmp => cmp,
-        }
-    }
-}
-
-impl PartialEq for StreamPriorityKey {
-    #[inline]
-    fn eq(&self, other: &StreamPriorityKey) -> bool {
-        self.urgency == other.urgency &&
-            self.incremental == other.incremental &&
-            self.magic.load(atomic::Ordering::SeqCst) ==
-                other.magic.load(atomic::Ordering::SeqCst) &&
-            self.id == other.id
-    }
-}
-
 impl PartialOrd for StreamPriorityKey {
-    #[inline]
-    fn partial_cmp(&self, other: &StreamPriorityKey) -> Option<Ordering> {
-        match PartialOrd::partial_cmp(&self.urgency, &other.urgency) {
-            Some(Ordering::Equal) => {
-                match PartialOrd::partial_cmp(
-                    &self.incremental,
-                    &other.incremental,
-                ) {
-                    Some(Ordering::Equal) => {
-                        match PartialOrd::partial_cmp(
-                            &self.magic.load(atomic::Ordering::SeqCst),
-                            &other.magic.load(atomic::Ordering::SeqCst),
-                        ) {
-                            Some(Ordering::Equal) =>
-                                PartialOrd::partial_cmp(&self.id, &other.id),
-                            cmp => cmp,
-                        }
-                    },
-                    cmp => cmp,
-                }
-            },
-            cmp => cmp,
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Ignore priority if ID matches.
+        if self.id == other.id {
+            return Some(std::cmp::Ordering::Equal);
         }
+
+        // First, order by urgency...
+        if self.urgency != other.urgency {
+            return self.urgency.partial_cmp(&other.urgency);
+        }
+
+        // ...when the urgency is the same, and both are not incremental, order
+        // by stream ID...
+        if !self.incremental && !other.incremental {
+            return self.id.partial_cmp(&other.id);
+        }
+
+        // ...non-incremental takes priority over incremental...
+        if self.incremental && !other.incremental {
+            return Some(std::cmp::Ordering::Greater);
+        }
+        if !self.incremental && other.incremental {
+            return Some(std::cmp::Ordering::Less);
+        }
+
+        // ...finally, when both are incremental, `other` takes precedence (so
+        // `self` is always sorted after other same-urgency incremental
+        // entries).
+        Some(std::cmp::Ordering::Greater)
+    }
+}
+
+impl Ord for StreamPriorityKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // `partial_cmp()` never returns `None`, so this should be safe.
+        self.partial_cmp(other).unwrap()
     }
 }
 
@@ -3698,7 +3614,8 @@ mod tests {
 
         let mut streams = StreamMap::new(100, 100, 100);
 
-        // Inserting in a "random" order still yields correct priority order.
+        // Inserting same-urgency incremental streams in a "random" order yields
+        // same order to start with.
         for id in [12, 4, 8, 0] {
             assert!(streams
                 .get_or_create(id, &local_tp, &peer_tp, false, true)
@@ -3706,7 +3623,15 @@ mod tests {
         }
 
         let walk_1: Vec<u64> = streams.writable_prioritized().collect();
-        assert_eq!(walk_1, vec![0, 4, 8, 12]);
+        let walk_2: Vec<u64> = streams.writable_prioritized().collect();
+        let walk_3: Vec<u64> = streams.writable_prioritized().collect();
+        let walk_4: Vec<u64> = streams.writable_prioritized().collect();
+        let walk_5: Vec<u64> = streams.writable_prioritized().collect();
+        assert_eq!(walk_1, vec![12, 4, 8, 0]);
+        assert_eq!(walk_2, vec![4, 8, 0, 12]);
+        assert_eq!(walk_3, vec![8, 0, 12, 4,]);
+        assert_eq!(walk_4, vec![0, 12, 4, 8]);
+        assert_eq!(walk_5, vec![12, 4, 8, 0]);
     }
 
     #[test]
@@ -3748,9 +3673,6 @@ mod tests {
             let new_priority_key = Arc::new(StreamPriorityKey {
                 urgency: stream.urgency,
                 incremental: stream.incremental,
-                magic: atomic::AtomicBool::new(
-                    old_priority_key.magic.load(atomic::Ordering::SeqCst),
-                ),
                 id,
                 writable: Default::default(),
             });
@@ -3781,9 +3703,6 @@ mod tests {
             let new_priority_key = Arc::new(StreamPriorityKey {
                 urgency: stream.urgency,
                 incremental: stream.incremental,
-                magic: atomic::AtomicBool::new(
-                    old_priority_key.magic.load(atomic::Ordering::SeqCst),
-                ),
                 id,
                 writable: Default::default(),
             });
@@ -3822,7 +3741,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_rbtrees_mixed_urgencies_incrementals() {
+    fn writable_prioritized_mixed_urgencies_incrementals() {
         let local_tp = crate::TransportParams::default();
         let mut peer_tp = crate::TransportParams::default();
 
@@ -3859,9 +3778,6 @@ mod tests {
             let new_priority_key = Arc::new(StreamPriorityKey {
                 urgency: stream.urgency,
                 incremental: stream.incremental,
-                magic: atomic::AtomicBool::new(
-                    old_priority_key.magic.load(atomic::Ordering::SeqCst),
-                ),
                 id,
                 writable: Default::default(),
             });
@@ -3913,9 +3829,6 @@ mod tests {
         let new_priority_key = Arc::new(StreamPriorityKey {
             urgency: stream.urgency,
             incremental: stream.incremental,
-            magic: atomic::AtomicBool::new(
-                old_priority_key.magic.load(atomic::Ordering::SeqCst),
-            ),
             id: 44,
             writable: Default::default(),
         });
@@ -3928,8 +3841,8 @@ mod tests {
             true,
         );
 
-        let walk_5: Vec<u64> = streams.writable_prioritized().collect();
-        assert_eq!(walk_5, vec![40, 12, 36, 44, 4, 28, 32, 16, 24, 0, 8]);
+        let walk_1: Vec<u64> = streams.writable_prioritized().collect();
+        assert_eq!(walk_1, vec![40, 12, 36, 4, 44, 28, 32, 16, 24, 0, 8]);
     }
 
     #[test]
@@ -3941,7 +3854,6 @@ mod tests {
             let s = Arc::new(StreamPriorityKey {
                 urgency: 0,
                 incremental: false,
-                magic: AtomicBool::new(false),
                 id,
                 writable: Default::default(),
             });
@@ -3959,7 +3871,6 @@ mod tests {
             let s = Arc::new(StreamPriorityKey {
                 urgency: 0,
                 incremental: false,
-                magic: AtomicBool::new(false),
                 id,
                 writable: Default::default(),
             });
