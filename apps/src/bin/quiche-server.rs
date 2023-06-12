@@ -479,7 +479,7 @@ fn main() {
                 let partial_responses = &mut client.partial_responses;
 
                 // Handle writable streams.
-                for stream_id in conn.writable() {
+                for stream_id in conn.writable_prioritized() {
                     http_conn.handle_writable(conn, partial_responses, stream_id);
                 }
 
