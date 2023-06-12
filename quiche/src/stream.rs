@@ -652,7 +652,8 @@ impl StreamMap {
         }
 
         StreamIter {
-            streams: ret.iter().copied().rev().collect(),
+            streams: ret.iter().copied().collect(),
+            index: 0,
         }
     }
 
@@ -927,6 +928,7 @@ impl<'a> KeyAdapter<'a> for StreamPriorityAdapter {
 #[derive(Default)]
 pub struct StreamIter {
     streams: SmallVec<[u64; 8]>,
+    index: usize,
 }
 
 impl StreamIter {
@@ -934,6 +936,7 @@ impl StreamIter {
     fn from(streams: &StreamIdHashSet) -> Self {
         StreamIter {
             streams: streams.iter().copied().collect(),
+            index: 0,
         }
     }
 }
@@ -943,14 +946,20 @@ impl Iterator for StreamIter {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.streams.pop()
+        let ret = self.streams.get(self.index).cloned();
+
+        if ret.is_some() {
+            self.index += 1;
+        }
+
+        ret
     }
 }
 
 impl ExactSizeIterator for StreamIter {
     #[inline]
     fn len(&self) -> usize {
-        self.streams.len()
+        self.streams.len() - self.index
     }
 }
 
